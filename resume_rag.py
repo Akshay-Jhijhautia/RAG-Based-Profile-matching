@@ -674,7 +674,7 @@ class OpenAIEmbedder:
         return vectors
 
 
-_STOPWORDS = frozenset(
+STOPWORDS = frozenset(
     "a an and are as at be by for from has have in into is it of on or our over the to "
     "using we will with you your experience years year building built strong".split()
 )
@@ -698,7 +698,7 @@ class HashingEmbedder:
     def _vector(self, text: str) -> list[float]:
         vector = [0.0] * self.dimensions
         for token in re.findall(r"[a-z0-9+#]+", text.lower()):
-            if token in _STOPWORDS:
+            if token in STOPWORDS:
                 continue
             digest = hashlib.md5(token.encode("utf-8")).digest()
             vector[int.from_bytes(digest[:4], "big") % self.dimensions] += 1.0
@@ -900,6 +900,16 @@ class ResumeRAG:
 
     def _all_records(self) -> list[dict]:
         return self.collection.get(include=["metadatas"])["metadatas"]
+
+    def all_chunks(self) -> list[dict]:
+        """Every stored chunk as ``{"id", "document", "metadata"}`` (for keyword search)."""
+        stored = self.collection.get(include=["documents", "metadatas"])
+        return [
+            {"id": chunk_id, "document": document, "metadata": record}
+            for chunk_id, document, record in zip(
+                stored["ids"], stored["documents"], stored["metadatas"]
+            )
+        ]
 
     def indexed_paths(self) -> set[str]:
         return {record["resume_path"] for record in self._all_records()}
