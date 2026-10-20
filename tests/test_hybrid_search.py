@@ -95,7 +95,7 @@ def test_hybrid_result_fields(matcher):
     assert alex["skill_coverage"] == pytest.approx(5 / 7, abs=1e-4)
     assert alex["keyword_score"] == 1.0
     assert alex["hybrid_score"] == pytest.approx(
-        job_matcher.hybrid_score(alex["semantic_score"], 1.0, alex["skill_coverage"]), abs=1e-4
+        job_matcher.hybrid_score(alex["semantic_norm"], 1.0, alex["skill_coverage"]), abs=1e-4
     )
     skills_chunk = next(c for c in alex["chunks"] if c["section"] == "Skills")
     assert {"Java", "Spring Boot", "Kafka"} <= set(skills_chunk["skills"])
@@ -132,3 +132,15 @@ def test_semantic_candidates_restricted_to_paths(matcher):
     paths = [str(RESUMES_DIR / "resume_alex_lee.txt")]
     assert list(matcher._semantic_candidates(query, paths)) == paths
     assert matcher._semantic_candidates(query, []) == {}
+
+
+def test_calibrate_semantic():
+    assert job_matcher.calibrate_semantic(0.40, "openai:text-embedding-3-small") == pytest.approx(0.5)
+    assert job_matcher.calibrate_semantic(0.10, "openai:x") == 0.0
+    assert job_matcher.calibrate_semantic(0.90, "openai:x") == 1.0
+    assert job_matcher.calibrate_semantic(0.25, "hashing:512") == pytest.approx(0.5)
+    assert job_matcher.calibrate_semantic(0.3, "unknown") == pytest.approx(0.3)
+
+
+def test_hybrid_search_k_none_returns_whole_pool(matcher):
+    assert len(matcher.hybrid_search(_jd("java_backend"), k=None)) == 12

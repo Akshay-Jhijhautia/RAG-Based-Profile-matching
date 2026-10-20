@@ -13,14 +13,27 @@ hybrid search:
 
 The candidate pool is the union of the semantic and keyword hits, so a resume
 with an exact critical skill is not missed when its embedding ranks low.
+Candidates failing a must-have are filtered out; the rest get a 0-100
+match score, matched skills, relevant excerpts and a written reasoning.
+
+CLI:
+    python job_matcher.py --jd-file job_descriptions/senior_python_ml.txt [--k 10]
+        [--must-have "Python:5"] [--ignore-jd-requirements] [--include-filtered]
+        [--details] [--out results/match.json]
 """
 
 from __future__ import annotations
 
+import argparse
+import json
+import logging
 import re
+import sys
 
+from dotenv import load_dotenv
 from rank_bm25 import BM25Okapi
 
+import fs_tools
 import resume_rag
 import skills_vocab
 
@@ -34,6 +47,11 @@ KEYWORD_WEIGHT = 0.2
 SKILL_WEIGHT = 0.3
 # Query repeats per skill token: required skills count double in BM25.
 REQUIRED_SKILL_BOOST = 2
+# Cosine similarity range mapped onto 0..1 before blending, per embedder kind.
+# Real embedders rarely go below ~0.2 for unrelated text or above ~0.6 for a
+# strong JD/resume match, so raw similarity would compress every score.
+SEMANTIC_RANGES = {"openai": (0.20, 0.60), "hashing": (0.0, 0.50)}
+DEFAULT_SEMANTIC_RANGE = (0.0, 1.0)
 # Chunks retrieved per query before grouping by candidate (about 4-5 per resume).
 CHUNK_POOL = 50
 # Candidate semantic score = blend of the best chunk and the mean of the top 3,
@@ -193,6 +211,12 @@ def _skill_match(required: list[str], preferred: list[str], candidate_skills: li
     }
 
 
+def calibrate_semantic(similarity: float, embedder_name: str) -> float:
+    """Map a raw cosine similarity onto 0..1 using the embedder's ``SEMANTIC_RANGES``."""
+    low, high = SEMANTIC_RANGES.get(embedder_name.partition(":")[0], DEFAULT_SEMANTIC_RANGE)
+    return min(1.0, max(0.0, (similarity - low) / (high - low)))
+
+
 def hybrid_score(semantic: float, keyword: float, skill_coverage: float | None) -> float:
     """Weighted blend of the three signals, each in 0..1."""
     if skill_coverage is None:
@@ -301,15 +325,17 @@ class JobMatcher:
     # --- hybrid ---
 
     def hybrid_search(
-        self, job_description: str, k: int = TOP_K, parsed: dict | None = None
+        self, job_description: str, k: int | None = TOP_K, parsed: dict | None = None
     ) -> list[dict]:
-        """Top-``k`` candidates by the hybrid of semantic, keyword and skill signals.
+        """Top-``k`` candidates (all of the pool if ``k`` is None) by the hybrid of
+        semantic, keyword and skill signals.
 
         The pool is every candidate in the semantic chunk pool plus the
         ``KEYWORD_POOL`` best keyword matches; keyword-only candidates get
         their semantic score from a query restricted to their own chunks.
 
         Each result extends the ``semantic_search`` fields with
+        ``semantic_norm`` (the semantic score calibrated to 0..1),
         ``keyword_score``, ``matched_skills``, ``missing_skills``,
         ``matched_preferred_skills``, ``skill_coverage`` (``None`` when the JD
         names no skills), ``hybrid_score`` (0..1) and, per chunk,
@@ -337,9 +363,12 @@ class JobMatcher:
             for chunk in candidate["chunks"]:
                 mentioned = set(skills_vocab.with_implied(skills_vocab.find_skills(chunk["text"])))
                 chunk["skills"] = [s for s in jd_skills if s in mentioned]
+            candidate["semantic_norm"] = round(
+                calibrate_semantic(candidate["semantic_score"], self.rag.embedder_name), 4
+            )
             candidate["hybrid_score"] = round(
                 hybrid_score(
-                    candidate["semantic_score"],
+                    candidate["semantic_norm"],
                     candidate["keyword_score"],
                     candidate["skill_coverage"],
                 ),
@@ -352,3 +381,334 @@ class JobMatcher:
             reverse=True,
         )
         return ranked[:k]
+
+    # --- ranking and output ---
+
+    def match(
+        self,
+        job_description: str,
+        k: int = TOP_K,
+        must_haves: list[dict] | None = None,
+        use_jd_must_haves: bool = True,
+        include_filtered: bool = False,
+        details: bool = False,
+    ) -> dict:
+        """Rank candidates for a job description and build the output document.
+
+        ``must_haves`` (e.g. from ``parse_must_have_spec``) are added to the
+        ones parsed from the JD, or replace them when ``use_jd_must_haves`` is
+        False. Candidates with a requirement ``not_met`` are filtered out
+        before taking the top ``k``; ``unverified`` ones (the resume does not
+        say) are kept and flagged in the reasoning.
+
+        Returns ``{"job_description", "top_matches": [{"candidate_name",
+        "resume_path", "match_score", "matched_skills", "relevant_excerpts",
+        "reasoning"}]}``. ``include_filtered`` adds ``"filtered_out"``;
+        ``details`` adds the parsed requirements and a score breakdown per match.
+        """
+        parsed = parse_job_description(job_description)
+        requirements = (parsed["must_haves"] if use_jd_must_haves else []) + (must_haves or [])
+        parsed["must_haves"] = _dedupe_must_haves(requirements)
+
+        matches, filtered = [], []
+        for candidate in self.hybrid_search(job_description, k=None, parsed=parsed):
+            checks = check_must_haves(candidate["metadata"], parsed["must_haves"])
+            score = round(100 * candidate["hybrid_score"])
+            failed = [c["detail"] for c in checks if c["status"] == "not_met"]
+            if failed:
+                filtered.append(
+                    {
+                        "candidate_name": candidate["candidate_name"],
+                        "resume_path": resume_rag.display_path(candidate["resume_path"]),
+                        "match_score": score,
+                        "failed_requirements": failed,
+                    }
+                )
+                continue
+            if len(matches) < k:
+                matches.append(self._format_match(candidate, score, checks, details))
+
+        output = {"job_description": parsed["text"], "top_matches": matches}
+        if details:
+            output["requirements"] = {
+                "required_skills": parsed["required_skills"],
+                "preferred_skills": parsed["preferred_skills"],
+                "must_haves": parsed["must_haves"],
+            }
+        if include_filtered or details:
+            output["filtered_out"] = filtered
+        return output
+
+    def _format_match(self, candidate: dict, score: int, checks: list[dict], details: bool) -> dict:
+        match = {
+            "candidate_name": candidate["candidate_name"],
+            "resume_path": resume_rag.display_path(candidate["resume_path"]),
+            "match_score": score,
+            "matched_skills": candidate["matched_skills"] + candidate["matched_preferred_skills"],
+            "relevant_excerpts": select_excerpts(candidate["chunks"]),
+            "reasoning": build_reasoning(candidate, score, checks),
+        }
+        if details:
+            meta = candidate["metadata"]
+            match["details"] = {
+                "semantic_similarity": candidate["semantic_score"],
+                "semantic_score": candidate["semantic_norm"],
+                "keyword_score": candidate["keyword_score"],
+                "skill_coverage": candidate["skill_coverage"],
+                "missing_skills": candidate["missing_skills"],
+                "must_have_checks": checks,
+                "experience_years": meta["experience_years"],
+                "highest_degree": meta["highest_degree"],
+            }
+        return match
+
+
+# --- must-have requirements ----------------------------------------------------------------------
+
+
+def parse_must_have_spec(spec: str) -> dict:
+    """Parse a CLI must-have: ``"Python:5"`` (5+ years of Python), ``"Python"``
+    (has the skill), ``"experience:5"`` (5+ years total), ``"degree:masters"``.
+    """
+    name, _, value = (part.strip() for part in spec.partition(":"))
+    if not name:
+        raise ValueError(f"Invalid must-have '{spec}'")
+    key = name.lower()
+    if key == "degree":
+        degree = resume_rag.degree_level(value) or resume_rag.degree_level(value + " degree")
+        if not degree:
+            raise ValueError(f"Unknown degree '{value}' (use bachelors, masters or phd)")
+        return {"type": "degree", "degree": degree, "source": spec}
+    years = None
+    if value:
+        try:
+            years = float(value.rstrip("+"))
+        except ValueError:
+            raise ValueError(f"Invalid years in must-have '{spec}'") from None
+    if key in {"experience", "years", "total"}:
+        if years is None:
+            raise ValueError(f"Must-have '{spec}' needs a number of years")
+        return {"type": "total_years", "min_years": years, "source": spec}
+    skill = skills_vocab.normalize_skill(name) or name
+    if years is None:
+        return {"type": "skill", "skill": skill, "source": spec}
+    return {"type": "skill_years", "skill": skill, "min_years": years, "source": spec}
+
+
+def _requirement_label(req: dict) -> str:
+    if req["type"] == "skill_years":
+        return f"{req['min_years']:g}+ yrs {req['skill']}"
+    if req["type"] == "total_years":
+        return f"{req['min_years']:g}+ yrs experience"
+    if req["type"] == "degree":
+        return f"{req['degree']} degree"
+    return req["skill"]
+
+
+def check_must_haves(metadata: dict, must_haves: list[dict]) -> list[dict]:
+    """Check a candidate against each must-have.
+
+    Each result is ``{"requirement", "status", "detail"}`` with ``status``
+    ``"met"``, ``"not_met"``, or ``"unverified"`` when the resume lists the
+    skill (or has no experience/education data) but gives no way to check it.
+    """
+    skills = {s.lower() for s in metadata["skills"]}
+    skill_years = {s.lower(): y for s, y in metadata["skill_years"].items()}
+    checks = []
+    for req in must_haves:
+        label = _requirement_label(req)
+        if req["type"] in {"skill", "skill_years"}:
+            skill = req["skill"].lower()
+            has = skill in skills or skill in skill_years
+            if not has:
+                status, detail = "not_met", f"no {req['skill']} on resume (needs {label})"
+            elif req["type"] == "skill":
+                status, detail = "met", f"has {req['skill']}"
+            elif skill not in skill_years:
+                status, detail = "unverified", f"lists {req['skill']} but years unclear (needs {label})"
+            else:
+                years = skill_years[skill]
+                status = "met" if years >= req["min_years"] else "not_met"
+                detail = f"{years:g} yrs {req['skill']} (needs {req['min_years']:g}+)"
+        elif req["type"] == "total_years":
+            years = metadata["experience_years"]
+            if years is None:
+                status, detail = "unverified", f"experience unclear (needs {label})"
+            else:
+                status = "met" if years >= req["min_years"] else "not_met"
+                detail = f"{years:g} yrs experience (needs {req['min_years']:g}+)"
+        else:
+            needed = resume_rag.DEGREE_LEVELS[req["degree"]]
+            have = metadata.get("degree_level") or 0
+            if have == 0 and not metadata["education"]:
+                status, detail = "unverified", f"education unclear (needs {label})"
+            else:
+                status = "met" if have >= needed else "not_met"
+                have_text = metadata["highest_degree"] or "no recognised degree"
+                detail = f"{have_text} (needs {req['degree']} or higher)"
+        checks.append({"requirement": label, "status": status, "detail": detail})
+    return checks
+
+
+# --- excerpts and reasoning ------------------------------------------------------------------------
+
+MAX_EXCERPTS = 3
+MAX_EXCERPT_CHARS = 300
+# Similarity bonus per JD skill a chunk mentions, so skill-bearing sections are quoted first.
+EXCERPT_SKILL_BONUS = 0.02
+
+
+def _trim(text: str, limit: int = MAX_EXCERPT_CHARS) -> str:
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return text
+    cut = text.rfind(" ", 0, limit)
+    return text[: cut if cut > 0 else limit] + "…"
+
+
+def _rank_chunks(chunks: list[dict]) -> list[dict]:
+    """Chunks by similarity, nudged up for each JD skill they mention."""
+    return sorted(
+        chunks,
+        key=lambda c: c["similarity"] + EXCERPT_SKILL_BONUS * len(c.get("skills", [])),
+        reverse=True,
+    )
+
+
+def select_excerpts(chunks: list[dict]) -> list[str]:
+    """Up to ``MAX_EXCERPTS`` of the most relevant chunks as ``"[Section] text"``."""
+    return [f"[{c['section']}] {_trim(c['text'])}" for c in _rank_chunks(chunks)[:MAX_EXCERPTS]]
+
+
+def _fit_label(score: int) -> str:
+    if score >= 75:
+        return "Strong match"
+    if score >= 55:
+        return "Good match"
+    if score >= 35:
+        return "Partial match"
+    return "Weak match"
+
+
+def _join(items: list[str]) -> str:
+    return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1]
+
+
+def build_reasoning(candidate: dict, score: int, checks: list[dict]) -> str:
+    """Explain a match: fit, skill coverage, which sections matched, must-haves."""
+    sentences = []
+    ranked = _rank_chunks(candidate["chunks"])
+    sections = []
+    for chunk in ranked:
+        if chunk["section"] not in sections:
+            sections.append(chunk["section"])
+    top_sections = sections[:2]
+    sentences.append(
+        f"{_fit_label(score)}: closest resume sections are {_join(top_sections)}"
+        if top_sections
+        else _fit_label(score)
+    )
+
+    matched, missing = candidate["matched_skills"], candidate["missing_skills"]
+    if candidate["skill_coverage"] is not None:
+        text = f"Has {len(matched)}/{len(matched) + len(missing)} required skills"
+        if missing:
+            text += f" (missing {_join(missing)})"
+        if candidate["matched_preferred_skills"]:
+            text += f", plus preferred {_join(candidate['matched_preferred_skills'])}"
+        sentences.append(text)
+
+    by_section: dict[str, list[str]] = {}
+    for chunk in ranked:
+        for skill in chunk.get("skills", []):
+            found = by_section.setdefault(chunk["section"], [])
+            if skill not in found:
+                found.append(skill)
+    if by_section:
+        parts = [f"{section} mentions {_join(skills[:5])}" for section, skills in by_section.items()]
+        sentences.append("; ".join(parts[:2]))
+
+    if checks:
+        met = [c["detail"] for c in checks if c["status"] == "met"]
+        unverified = [c["detail"] for c in checks if c["status"] == "unverified"]
+        if met:
+            sentences.append(f"Meets must-haves: {'; '.join(met)}")
+        if unverified:
+            sentences.append(f"Unverified: {'; '.join(unverified)}")
+
+    years = candidate["metadata"]["experience_years"]
+    if years is not None:
+        sentences.append(f"{years:g} years of total experience")
+    return ". ".join(sentences) + "."
+
+
+# --- CLI ------------------------------------------------------------------------------------------
+
+
+def _read_job_description(args: argparse.Namespace) -> str:
+    if args.jd:
+        return args.jd
+    result = fs_tools.read_file(args.jd_file)
+    if not result["success"]:
+        raise FileNotFoundError(f"Could not read job description: {result['error']}")
+    return result["content"]
+
+
+def main(argv: list[str] | None = None) -> int:
+    load_dotenv()
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
+
+    parser = argparse.ArgumentParser(description="Match a job description against indexed resumes.")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--jd", help="Job description text.")
+    source.add_argument("--jd-file", help="Job description file (TXT, MD, PDF or DOCX).")
+    parser.add_argument("--k", type=int, default=TOP_K, help=f"Number of matches (default: {TOP_K}).")
+    parser.add_argument(
+        "--must-have", action="append", default=[], metavar="SPEC",
+        help='Extra requirement, repeatable: "Python:5", "Python", "experience:5", "degree:masters".',
+    )
+    parser.add_argument(
+        "--ignore-jd-requirements", action="store_true",
+        help="Do not apply must-haves parsed from the JD text (only --must-have).",
+    )
+    parser.add_argument("--include-filtered", action="store_true", help="List candidates removed by must-haves.")
+    parser.add_argument("--details", action="store_true", help="Add requirements and score breakdowns.")
+    parser.add_argument("--out", help="Also write the JSON to this file.")
+    parser.add_argument("--db", default=resume_rag.DEFAULT_DB_DIR, help="ChromaDB directory.")
+    args = parser.parse_args(argv)
+    if args.k < 1:
+        parser.error("--k must be at least 1")
+
+    try:
+        must_haves = [parse_must_have_spec(spec) for spec in args.must_have]
+        job_description = _read_job_description(args)
+        rag = resume_rag.ResumeRAG(args.db)
+        if rag.collection.count() == 0:
+            raise ValueError(f"The index at '{args.db}' is empty. Run: python resume_rag.py index resumes")
+        if resume_rag.missing_api_key(rag.embedder_name):
+            raise ValueError(f"OPENAI_API_KEY is not set (the index uses {rag.embedder_name}).")
+        result = JobMatcher(rag).match(
+            job_description,
+            k=args.k,
+            must_haves=must_haves,
+            use_jd_must_haves=not args.ignore_jd_requirements,
+            include_filtered=args.include_filtered,
+            details=args.details,
+        )
+    except resume_rag.CLI_ERRORS as exc:
+        print(f"Error: {resume_rag.cli_error_message(exc)}", file=sys.stderr)
+        return 1
+
+    text = json.dumps(result, indent=2, ensure_ascii=False)
+    print(text)
+    if args.out:
+        written = fs_tools.write_file(args.out, text + "\n")
+        if not written["success"]:
+            print(f"Error: {written['error']}", file=sys.stderr)
+            return 1
+        print(f"Saved to {resume_rag.display_path(written['filepath'])}", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

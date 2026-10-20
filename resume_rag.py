@@ -934,11 +934,35 @@ class ResumeRAG:
 # --- CLI --------------------------------------------------------------------------------------------
 
 
-def _display_path(path: str) -> str:
+def display_path(path: str) -> str:
+    """``path`` relative to the working directory when it is inside it."""
     try:
         return str(Path(path).relative_to(Path.cwd()))
     except ValueError:
         return path
+
+
+# Expected failures reported as one line instead of a traceback
+# (EmbedderMismatchError is a ValueError).
+CLI_ERRORS = (FileNotFoundError, NotADirectoryError, ValueError, openai.OpenAIError)
+
+
+def cli_error_message(exc: Exception) -> str:
+    """A one-line explanation of an expected CLI failure."""
+    if isinstance(exc, openai.AuthenticationError):
+        return "authentication failed. Check OPENAI_API_KEY."
+    if isinstance(exc, openai.RateLimitError):
+        return f"rate limited or out of quota: {exc}"
+    if isinstance(exc, openai.APIConnectionError):
+        return "could not reach the OpenAI API. Check your connection."
+    if isinstance(exc, openai.OpenAIError):
+        return f"OpenAI API error: {exc}"
+    return str(exc)
+
+
+def missing_api_key(embedder_name: str) -> bool:
+    """True when ``embedder_name`` needs OpenAI but no ``OPENAI_API_KEY`` is set."""
+    return embedder_name.startswith("openai") and not os.getenv("OPENAI_API_KEY")
 
 
 def _print_resume_line(meta: dict) -> None:
@@ -946,12 +970,12 @@ def _print_resume_line(meta: dict) -> None:
     years_text = f"{years:g} yrs" if years is not None else "? yrs"
     print(
         f"  {meta['candidate_name']:<20} {years_text:>8}  {meta['highest_degree'] or '-':<11} "
-        f"{len(meta['skills']):>2} skills  {_display_path(meta['resume_path'])}"
+        f"{len(meta['skills']):>2} skills  {display_path(meta['resume_path'])}"
     )
 
 
 def _run_index(args: argparse.Namespace) -> int:
-    if args.embedder == "openai" and not os.getenv("OPENAI_API_KEY"):
+    if args.embedder == "openai" and missing_api_key(default_embedder_name()):
         print(
             "Error: OPENAI_API_KEY is not set. Add it to .env, or use --embedder hashing "
             "to index offline.",
@@ -973,7 +997,7 @@ def _run_index(args: argparse.Namespace) -> int:
         if meta["resume_path"] in indexed:
             _print_resume_line(meta)
     for path in summary["removed"]:
-        print(f"  removed {_display_path(path)}")
+        print(f"  removed {display_path(path)}")
     return 0
 
 
@@ -1012,16 +1036,8 @@ def main(argv: list[str] | None = None) -> int:
             for meta in resumes:
                 _print_resume_line(meta)
         return 0
-    except (FileNotFoundError, NotADirectoryError, EmbedderMismatchError) as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-    except openai.AuthenticationError:
-        print("Error: authentication failed. Check OPENAI_API_KEY.", file=sys.stderr)
-    except openai.RateLimitError as exc:
-        print(f"Error: rate limited or out of quota: {exc}", file=sys.stderr)
-    except openai.APIConnectionError:
-        print("Error: could not reach the OpenAI API. Check your connection.", file=sys.stderr)
-    except openai.OpenAIError as exc:
-        print(f"Error: OpenAI API error: {exc}", file=sys.stderr)
+    except CLI_ERRORS as exc:
+        print(f"Error: {cli_error_message(exc)}", file=sys.stderr)
     return 1
 
 
