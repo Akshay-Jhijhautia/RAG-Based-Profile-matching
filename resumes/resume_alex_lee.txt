@@ -1,0 +1,18 @@
+Alex Lee
+alex.lee@example.com | (555) 010-9012 | Chicago, IL
+
+SUMMARY
+Enterprise Java developer with 8 years of experience in financial services.
+
+SKILLS
+Java 17, Spring Boot, Hibernate, Kafka, Oracle, Kubernetes, Maven, JUnit
+
+EXPERIENCE
+Lead Java Developer, Fabrikam Bank (2019 - Present)
+- Architected Spring Boot services for real-time trade settlement.
+- Introduced Kafka event streaming across 12 teams.
+Java Developer, Tailspin Insurance (2016 - 2019)
+- Maintained claims processing system built on Spring and Hibernate.
+
+EDUCATION
+B.S. Software Engineering, Illinois Institute of Technology, 2016

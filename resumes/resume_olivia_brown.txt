@@ -1,0 +1,18 @@
+Olivia Brown
+olivia.brown@example.com | (555) 010-5566 | Pittsburgh, PA
+
+SUMMARY
+Computer vision engineer applying deep learning to robotics and medical imaging.
+
+TECHNICAL SKILLS
+Python, TensorFlow, Keras, PyTorch, OpenCV, C++, CUDA, deep learning, computer vision, NumPy
+
+PROFESSIONAL EXPERIENCE
+Computer Vision Engineer, Contoso Robotics (Feb 2022 – Present)
+- Trained TensorFlow object-detection models for warehouse robots at 30 FPS.
+- Optimized inference with CUDA and C++ kernels.
+Research Assistant, Carnegie Mellon University (Sep 2020 – Jan 2022)
+- Developed PyTorch segmentation models for MRI scans in Python.
+
+EDUCATION
+M.S. Robotics, Carnegie Mellon University, 2022

@@ -1,0 +1,17 @@
+Sofia Rossi
+sofia.rossi@example.com | (555) 010-1122 | Miami, FL
+
+SUMMARY
+Mobile engineer with 5 years of experience building iOS and Android apps.
+
+SKILLS
+Swift, SwiftUI, Kotlin, Jetpack Compose, Flutter, Dart, Firebase, REST APIs, Git, XCTest
+
+EXPERIENCE
+Senior Mobile Engineer, Trey Research (2022 - Present)
+- Led the SwiftUI rewrite of a banking app with 2M monthly active users.
+Mobile Developer, Proseware Inc. (2020 - 2022)
+- Shipped cross-platform Flutter apps and Kotlin Android features.
+
+EDUCATION
+B.S. Computer Science, Florida International University, 2020

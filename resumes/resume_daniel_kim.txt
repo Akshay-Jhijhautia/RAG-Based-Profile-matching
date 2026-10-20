@@ -1,0 +1,20 @@
+Daniel Kim
+daniel.kim@example.com | (555) 010-1357 | Denver, CO
+
+SUMMARY
+Junior Python developer who enjoys building small web apps and automation scripts.
+
+SKILLS
+Python, Flask, SQLite, HTML, CSS, JavaScript, Git, pytest
+
+EXPERIENCE
+Junior Software Developer, Pinecrest Software (Jul 2024 – Present)
+- Maintained internal Flask tools and wrote pytest suites for them.
+Software Engineering Intern, Pinecrest Software (Jun 2023 – Aug 2023)
+- Automated report generation with Python scripts, saving 5 hours per week.
+
+PROJECTS
+Recipe Finder – Flask web app with SQLite search and a REST API.
+
+EDUCATION
+B.S. Computer Science, University of Colorado Boulder, 2024
