@@ -112,7 +112,7 @@ def test_chunk_resume_one_chunk_per_section_and_skips_short_header():
     chunks = resume_rag.chunk_resume(SAMPLE, "Ada Lovelace", "resumes/ada.txt")
     assert [c["section"] for c in chunks] == ["Summary", "Skills", "Experience", "Education"]
     assert [c["chunk_index"] for c in chunks] == [0, 1, 2, 3]
-    assert chunks[2]["id"] == "ada::experience::0"
+    assert chunks[2]["id"] == "ada.txt::experience::0"
     assert chunks[1]["document"] == (
         "Candidate: Ada Lovelace | Section: Skills\nPython, Django, PostgreSQL"
     )
@@ -141,7 +141,7 @@ def test_long_experience_splits_between_roles_not_inside_them():
 
     assert len(chunks) > 1
     assert all(len(c["text"]) <= 500 for c in chunks)
-    assert [c["id"] for c in chunks] == [f"x::experience::{i}" for i in range(len(chunks))]
+    assert [c["id"] for c in chunks] == [f"x.txt::experience::{i}" for i in range(len(chunks))]
     for chunk in chunks:
         assert chunk["text"].startswith("Engineer ")  # every chunk begins at a role title
     joined = "\n".join(c["text"] for c in chunks)

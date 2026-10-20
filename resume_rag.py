@@ -3,20 +3,35 @@
 Resumes are read with the Milestone 1 file system tools (``fs_tools``), split
 into their natural sections (Summary, Skills, Experience, Education, ...) and
 chunked so that a chunk never mixes two sections and, where possible, never
-splits a single job entry.
+splits a single job entry. Each chunk is embedded and stored in a local
+ChromaDB collection together with the resume's metadata (name, skills,
+experience years, education), so the job matcher can filter and rank on it.
+
+CLI:
+    python resume_rag.py index [resumes/] [--embedder openai|hashing] [--force] [--reset]
+    python resume_rag.py stats
+    python resume_rag.py list
 """
 
 from __future__ import annotations
 
+import argparse
+import hashlib
 import json
 import logging
+import math
 import os
 import re
+import sys
 from collections import defaultdict
 from datetime import date
 from pathlib import Path
+from typing import Protocol
 
+import chromadb
 import openai
+from chromadb.config import Settings
+from chromadb.errors import NotFoundError
 from dotenv import load_dotenv
 
 import fs_tools
@@ -26,6 +41,13 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_LLM_MODEL = "gpt-4o-mini"
 LLM_MAX_INPUT_CHARS = 12000
+DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
+EMBED_BATCH_SIZE = 100
+DEFAULT_DB_DIR = "chroma_db"
+COLLECTION_NAME = "resumes"
+# Part of every resume's content hash: bump it when chunking or metadata
+# extraction changes so the next `index` run refreshes every resume.
+PIPELINE_VERSION = "1"
 
 MAX_CHUNK_CHARS = 1500
 HEADER_SECTION = "Header"
@@ -256,7 +278,7 @@ def chunk_resume(
     text (used for excerpts) and ``document`` adds a
     ``"Candidate: ... | Section: ..."`` prefix that gives the embedding context.
     """
-    stem = Path(resume_path).stem
+    file_name = Path(resume_path).name
     chunks = []
     index = 0
     for section, body in split_sections(text).items():
@@ -265,7 +287,7 @@ def chunk_resume(
         for part, piece in enumerate(_section_pieces(section, body, max_chars)):
             chunks.append(
                 {
-                    "id": f"{stem}::{section.lower()}::{part}",
+                    "id": f"{file_name}::{section.lower()}::{part}",
                     "section": section,
                     "chunk_index": index,
                     "text": piece,
@@ -619,3 +641,367 @@ def extract_metadata(
     if not metadata["name"]:
         metadata["name"] = _name_from_path(resume_path) if resume_path else None
     return metadata
+
+
+# --- embeddings -------------------------------------------------------------------------------
+
+
+class Embedder(Protocol):
+    name: str  # recorded on the collection so queries use the embedder that built it
+
+    def embed(self, texts: list[str]) -> list[list[float]]: ...
+
+
+class OpenAIEmbedder:
+    """OpenAI embeddings (``text-embedding-3-small`` by default), sent in batches."""
+
+    def __init__(self, model: str | None = None, client=None, batch_size: int = EMBED_BATCH_SIZE):
+        self.model = model or os.getenv("OPENAI_EMBEDDING_MODEL") or DEFAULT_EMBEDDING_MODEL
+        self.client = client or openai.OpenAI()
+        self.batch_size = batch_size
+        self.name = f"openai:{self.model}"
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        vectors = []
+        for i in range(0, len(texts), self.batch_size):
+            response = self.client.embeddings.create(
+                model=self.model, input=texts[i : i + self.batch_size]
+            )
+            vectors.extend(item.embedding for item in sorted(response.data, key=lambda d: d.index))
+        return vectors
+
+
+class HashingEmbedder:
+    """Offline bag-of-words embedder: hashed token counts, L2-normalized.
+
+    It only captures word overlap, not meaning. It exists for tests and for
+    trying the pipeline without an API key.
+    """
+
+    def __init__(self, dimensions: int = 512):
+        self.dimensions = dimensions
+        self.name = f"hashing:{dimensions}"
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        return [self._vector(text) for text in texts]
+
+    def _vector(self, text: str) -> list[float]:
+        vector = [0.0] * self.dimensions
+        for token in re.findall(r"[a-z0-9+#]+", text.lower()):
+            digest = hashlib.md5(token.encode("utf-8")).digest()
+            vector[int.from_bytes(digest[:4], "big") % self.dimensions] += 1.0
+        norm = math.sqrt(sum(v * v for v in vector)) or 1.0
+        return [v / norm for v in vector]
+
+
+def embedder_from_name(name: str) -> Embedder:
+    """Rebuild an embedder from the ``name`` stored on a collection."""
+    kind, _, arg = name.partition(":")
+    if kind == "openai":
+        return OpenAIEmbedder(model=arg or None)
+    if kind == "hashing":
+        return HashingEmbedder(int(arg) if arg else 512)
+    raise ValueError(f"Unknown embedder '{name}'")
+
+
+def default_embedder_name() -> str:
+    return f"openai:{os.getenv('OPENAI_EMBEDDING_MODEL') or DEFAULT_EMBEDDING_MODEL}"
+
+
+# --- vector store ---------------------------------------------------------------------------------
+
+
+class EmbedderMismatchError(ValueError):
+    """The index was built with a different embedder than the one requested."""
+
+
+def _content_hash(content: str) -> str:
+    return hashlib.sha256(f"{PIPELINE_VERSION}\n{content}".encode("utf-8")).hexdigest()
+
+
+def _chunk_record(chunk: dict, meta: dict, file_name: str, content_hash: str) -> dict:
+    """Chroma metadata for one chunk: chunk fields plus the resume's metadata.
+
+    Chroma accepts scalars and lists but not dicts or ``None``, so
+    ``skill_years`` is stored as JSON and empty values are left out.
+    """
+    record = {
+        "candidate_name": chunk["candidate_name"],
+        "resume_path": chunk["resume_path"],
+        "file_name": file_name,
+        "section": chunk["section"],
+        "chunk_index": chunk["chunk_index"],
+        "content_hash": content_hash,
+        "email": meta["email"],
+        "skills": meta["skills"],
+        "skill_years": json.dumps(meta["skill_years"]),
+        "experience_years": meta["experience_years"],
+        "education": meta["education"],
+        "highest_degree": meta["highest_degree"],
+        "degree_level": DEGREE_LEVELS.get(meta["highest_degree"], 0),
+        "llm_fields": meta["llm_fields"],
+    }
+    return {key: value for key, value in record.items() if value not in (None, [], "")}
+
+
+def parse_record(record: dict) -> dict:
+    """Resume-level metadata from a stored chunk record (inverse of ``_chunk_record``)."""
+    return {
+        "candidate_name": record["candidate_name"],
+        "resume_path": record["resume_path"],
+        "file_name": record.get("file_name", Path(record["resume_path"]).name),
+        "email": record.get("email"),
+        "skills": list(record.get("skills", [])),
+        "skill_years": json.loads(record.get("skill_years", "{}")),
+        "experience_years": record.get("experience_years"),
+        "education": list(record.get("education", [])),
+        "highest_degree": record.get("highest_degree"),
+        "degree_level": record.get("degree_level", 0),
+    }
+
+
+class ResumeRAG:
+    """Indexes resumes into a persistent ChromaDB collection (cosine similarity).
+
+    The collection records which embedder built it; opening it with a
+    different one raises ``EmbedderMismatchError`` (use ``reset=True`` to
+    rebuild). With no ``embedder`` given, the recorded one is reused, so the
+    job matcher always embeds queries the same way the resumes were embedded.
+    """
+
+    def __init__(
+        self,
+        persist_dir: str = DEFAULT_DB_DIR,
+        embedder: Embedder | None = None,
+        llm_client=None,
+        collection_name: str = COLLECTION_NAME,
+        reset: bool = False,
+    ):
+        self.persist_dir = persist_dir
+        self.llm_client = llm_client
+        self._embedder = embedder
+        self._client = chromadb.PersistentClient(
+            path=persist_dir, settings=Settings(anonymized_telemetry=False)
+        )
+        if reset:
+            try:
+                self._client.delete_collection(collection_name)
+            except NotFoundError:
+                pass
+        self.collection = self._open_collection(collection_name)
+
+    def _open_collection(self, name: str):
+        try:
+            collection = self._client.get_collection(name, embedding_function=None)
+        except NotFoundError:
+            embedder_name = self._embedder.name if self._embedder else default_embedder_name()
+            return self._client.create_collection(
+                name,
+                metadata={"hnsw:space": "cosine", "embedder": embedder_name},
+                embedding_function=None,
+            )
+        stored = (collection.metadata or {}).get("embedder")
+        if self._embedder and stored and stored != self._embedder.name:
+            raise EmbedderMismatchError(
+                f"Index at '{self.persist_dir}' was built with '{stored}', not "
+                f"'{self._embedder.name}'. Re-index with --reset to switch embedders."
+            )
+        return collection
+
+    @property
+    def embedder_name(self) -> str:
+        return (self.collection.metadata or {}).get("embedder", default_embedder_name())
+
+    @property
+    def embedder(self) -> Embedder:
+        if self._embedder is None:
+            self._embedder = embedder_from_name(self.embedder_name)
+        return self._embedder
+
+    # --- indexing ---
+
+    def index_directory(self, directory: str, force: bool = False) -> dict:
+        """Index every resume in ``directory``; skip unchanged ones unless ``force``.
+
+        Resumes previously indexed from this directory whose files are gone
+        (or no longer readable) are removed from the index.
+
+        Returns ``{"indexed", "unchanged", "removed"}`` (lists of resume paths)
+        and ``"chunks"`` (number of chunks written).
+        """
+        summary = {"indexed": [], "unchanged": [], "removed": [], "chunks": 0}
+        seen = set()
+        for resume in load_resumes(directory):
+            path = resume["path"]
+            seen.add(path)
+            content_hash = _content_hash(resume["content"])
+            if not force and self._stored_hash(path) == content_hash:
+                summary["unchanged"].append(path)
+                continue
+            summary["chunks"] += self.index_resume(resume, content_hash)
+            summary["indexed"].append(path)
+
+        directory_path = Path(directory).expanduser().resolve()
+        for path in sorted(self.indexed_paths() - seen):
+            if Path(path).parent == directory_path:
+                self.remove_resume(path)
+                summary["removed"].append(path)
+        return summary
+
+    def index_resume(self, resume: dict, content_hash: str | None = None) -> int:
+        """Chunk, extract metadata, embed and store one resume from ``load_resumes``.
+
+        Replaces any chunks already stored for the same path. Returns the
+        number of chunks written.
+        """
+        path, content = resume["path"], resume["content"]
+        meta = extract_metadata(content, path, llm_client=self.llm_client)
+        chunks = chunk_resume(content, meta["name"], path)
+        if not chunks:
+            logger.warning("No content to index in %s", path)
+            return 0
+        # Embed before deleting so a failed API call leaves the old version intact.
+        vectors = self.embedder.embed([c["document"] for c in chunks])
+        file_name = resume.get("file_name") or Path(path).name
+        content_hash = content_hash or _content_hash(content)
+        path_key = hashlib.sha1(path.encode("utf-8")).hexdigest()[:8]
+
+        self.remove_resume(path)
+        self.collection.add(
+            ids=[f"{c['id']}@{path_key}" for c in chunks],
+            embeddings=vectors,
+            documents=[c["document"] for c in chunks],
+            metadatas=[_chunk_record(c, meta, file_name, content_hash) for c in chunks],
+        )
+        return len(chunks)
+
+    def remove_resume(self, resume_path: str) -> None:
+        self.collection.delete(where={"resume_path": resume_path})
+
+    def _stored_hash(self, resume_path: str) -> str | None:
+        found = self.collection.get(
+            where={"resume_path": resume_path}, limit=1, include=["metadatas"]
+        )
+        return found["metadatas"][0].get("content_hash") if found["ids"] else None
+
+    # --- reading ---
+
+    def _all_records(self) -> list[dict]:
+        return self.collection.get(include=["metadatas"])["metadatas"]
+
+    def indexed_paths(self) -> set[str]:
+        return {record["resume_path"] for record in self._all_records()}
+
+    def list_resumes(self) -> list[dict]:
+        """One metadata dict per indexed resume, sorted by candidate name."""
+        resumes = {}
+        for record in self._all_records():
+            resumes.setdefault(record["resume_path"], parse_record(record))
+        return sorted(resumes.values(), key=lambda r: r["candidate_name"].lower())
+
+    def stats(self) -> dict:
+        return {
+            "persist_dir": self.persist_dir,
+            "collection": self.collection.name,
+            "embedder": self.embedder_name,
+            "resumes": len(self.indexed_paths()),
+            "chunks": self.collection.count(),
+        }
+
+
+# --- CLI --------------------------------------------------------------------------------------------
+
+
+def _display_path(path: str) -> str:
+    try:
+        return str(Path(path).relative_to(Path.cwd()))
+    except ValueError:
+        return path
+
+
+def _print_resume_line(meta: dict) -> None:
+    years = meta["experience_years"]
+    years_text = f"{years:g} yrs" if years is not None else "? yrs"
+    print(
+        f"  {meta['candidate_name']:<20} {years_text:>8}  {meta['highest_degree'] or '-':<11} "
+        f"{len(meta['skills']):>2} skills  {_display_path(meta['resume_path'])}"
+    )
+
+
+def _run_index(args: argparse.Namespace) -> int:
+    if args.embedder == "openai" and not os.getenv("OPENAI_API_KEY"):
+        print(
+            "Error: OPENAI_API_KEY is not set. Add it to .env, or use --embedder hashing "
+            "to index offline.",
+            file=sys.stderr,
+        )
+        return 1
+    embedder = OpenAIEmbedder() if args.embedder == "openai" else HashingEmbedder()
+    llm_client = None if args.no_llm else make_llm_client()
+    rag = ResumeRAG(args.db, embedder=embedder, llm_client=llm_client, reset=args.reset)
+    summary = rag.index_directory(args.directory, force=args.force)
+
+    print(
+        f"Indexed {len(summary['indexed'])} resume(s) ({summary['chunks']} chunks), "
+        f"{len(summary['unchanged'])} unchanged, {len(summary['removed'])} removed "
+        f"[{rag.embedder_name}, db: {args.db}]"
+    )
+    indexed = set(summary["indexed"])
+    for meta in rag.list_resumes():
+        if meta["resume_path"] in indexed:
+            _print_resume_line(meta)
+    for path in summary["removed"]:
+        print(f"  removed {_display_path(path)}")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    load_dotenv()
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
+
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--db", default=DEFAULT_DB_DIR, help=f"ChromaDB directory (default: {DEFAULT_DB_DIR}).")
+    parser = argparse.ArgumentParser(description="Index resumes into a ChromaDB vector store.")
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    index = commands.add_parser("index", parents=[common], help="Index a directory of resumes.")
+    index.add_argument("directory", nargs="?", default="resumes", help="Default: resumes")
+    index.add_argument(
+        "--embedder", choices=["openai", "hashing"], default="openai",
+        help="openai (default) or hashing (offline, keyword-only).",
+    )
+    index.add_argument("--no-llm", action="store_true", help="Disable the LLM metadata fallback.")
+    index.add_argument("--force", action="store_true", help="Re-index unchanged resumes too.")
+    index.add_argument("--reset", action="store_true", help="Delete the index first (needed to switch embedders).")
+    commands.add_parser("stats", parents=[common], help="Show index statistics.")
+    commands.add_parser("list", parents=[common], help="List indexed candidates.")
+    args = parser.parse_args(argv)
+
+    try:
+        if args.command == "index":
+            return _run_index(args)
+        rag = ResumeRAG(args.db)
+        if args.command == "stats":
+            for key, value in rag.stats().items():
+                print(f"{key:>12}: {value}")
+        else:
+            resumes = rag.list_resumes()
+            print(f"{len(resumes)} indexed resume(s):")
+            for meta in resumes:
+                _print_resume_line(meta)
+        return 0
+    except (FileNotFoundError, NotADirectoryError, EmbedderMismatchError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+    except openai.AuthenticationError:
+        print("Error: authentication failed. Check OPENAI_API_KEY.", file=sys.stderr)
+    except openai.RateLimitError as exc:
+        print(f"Error: rate limited or out of quota: {exc}", file=sys.stderr)
+    except openai.APIConnectionError:
+        print("Error: could not reach the OpenAI API. Check your connection.", file=sys.stderr)
+    except openai.OpenAIError as exc:
+        print(f"Error: OpenAI API error: {exc}", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
