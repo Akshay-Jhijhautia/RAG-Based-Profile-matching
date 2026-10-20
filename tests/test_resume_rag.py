@@ -1,5 +1,9 @@
+import json
+from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 
+import openai
 import pytest
 
 import resume_rag
@@ -162,3 +166,195 @@ def test_date_range_detects_role_lines(line):
 
 def test_bullet_with_dates_is_not_a_role_line():
     assert not resume_rag._is_entry_start("- Migrated systems from 2019 - 2020")
+
+
+# --- metadata extraction ------------------------------------------------------------------
+
+TODAY = date(2026, 10, 20)
+
+
+def _meta(text, **kwargs):
+    return resume_rag.extract_metadata(text, today=TODAY, **kwargs)
+
+
+def test_extract_metadata_from_sample_text():
+    meta = _meta(SAMPLE)
+    assert meta["name"] == "Ada Lovelace"
+    assert meta["email"] == "ada@example.com"
+    assert meta["skills"][:3] == ["Python", "Django", "PostgreSQL"]
+    # Jan 2021 - Oct 2026 (70 months) + 2018 - 2020 (24 months)
+    assert meta["experience_years"] == 7.8
+    assert meta["education"] == ["B.S. Computer Science, MIT, 2018"]
+    assert meta["highest_degree"] == "Bachelor's"
+    assert meta["llm_fields"] == []
+
+
+def test_name_skips_title_and_contact_lines():
+    text = "RESUME\njane@x.com | 555-123-4567\nJane Q. O'Neil\nSKILLS\nPython"
+    assert _meta(text)["name"] == "Jane Q. O'Neil"
+
+
+def test_name_allows_particles_and_rejects_lowercase_prose():
+    assert _meta("Juan de la Cruz\nSKILLS\nPython")["name"] == "Juan de la Cruz"
+    assert _meta("José García\nSKILLS\nPython")["name"] == "José García"
+    assert _meta("built many apps\nSKILLS\nPython")["name"] is None
+
+
+def test_name_falls_back_to_file_name():
+    meta = _meta("SKILLS\nPython", resume_path="resumes/resume_mary_jones.pdf")
+    assert meta["name"] == "Mary Jones"
+
+
+def test_skills_list_parsing():
+    text = (
+        "SKILLS\nLanguages: Python 3.11, Java 17; Scala\n"
+        "AWS (EC2, S3, Lambda) | sklearn • Hugging Face Transformers\nWCAG accessibility"
+    )
+    assert _meta(text)["skills"] == [
+        "Python", "Java", "Scala", "AWS", "EC2", "S3", "Lambda", "scikit-learn", "Hugging Face",
+        "WCAG accessibility",
+    ]
+
+
+def test_skills_include_prose_mentions_and_implied_languages():
+    text = "SKILLS\nDjango\nEXPERIENCE\nDev, X (2020 - 2022)\n- Shipped Kafka consumers."
+    assert _meta(text)["skills"] == ["Django", "Kafka", "Python"]
+
+
+def test_experience_merges_overlapping_roles():
+    text = (
+        "EXPERIENCE\nA, X (2015 - 2020)\n- did things\nB, Y (2018 - 2019)\n"
+        "C, Z (Mar 2021 - Feb 2022)\nEDUCATION\nB.S. Math (2011 - 2015)"
+    )
+    # 2015-2020 (60) + Mar 2021-Feb 2022 inclusive (12) = 72 months; education dates ignored
+    assert _meta(text)["experience_years"] == 6.0
+
+
+def test_experience_present_is_capped_at_today_and_future_ignored():
+    text = "EXPERIENCE\nA, X (Oct 2025 - Present)\nB, Y (2030 - 2031)"
+    assert _meta(text)["experience_years"] == 1.1
+
+
+def test_experience_falls_back_to_years_phrase():
+    text = "SUMMARY\nAnalyst with 4+ years of hands-on experience.\nEXPERIENCE\nAnalyst at X"
+    assert _meta(text)["experience_years"] == 4.0
+
+
+def test_skill_years_from_roles_implied_and_explicit_claims():
+    text = (
+        "SUMMARY\nEngineer with 10 years of Go experience.\n"
+        "EXPERIENCE\nDev, A (2020 - 2024)\n- Built Flask apps.\n"
+        "Dev, B (2016 - 2020)\n- Wrote Python scripts and Go services."
+    )
+    years = _meta(text)["skill_years"]
+    assert years["Python"] == 8.0  # 2016-2020 directly + 2020-2024 via Flask
+    assert years["Flask"] == 4.0
+    assert years["Go"] == 10.0  # explicit claim beats the 4 years from roles
+
+
+@pytest.mark.parametrize(
+    "line, expected",
+    [
+        ("Ph.D. Physics, MIT", "PhD"),
+        ("PhD in NLP", "PhD"),
+        ("M.S. Statistics, UW", "Master's"),
+        ("MSc Data Science", "Master's"),
+        ("MBA, Wharton", "Master's"),
+        ("Master of Engineering", "Master's"),
+        ("B.Tech. Computer Science", "Bachelor's"),
+        ("B.A. Design", "Bachelor's"),
+        ("Bachelor of Science", "Bachelor's"),
+        ("Associate degree in IT", "Associate"),
+        ("Coursera Machine Learning certificate", None),
+    ],
+)
+def test_degree_level(line, expected):
+    assert resume_rag.degree_level(line) == expected
+
+
+def test_highest_degree_wins():
+    meta = _meta("EDUCATION\nB.S. CS, 2010\nPh.D. CS, 2016\nM.S. CS, 2012")
+    assert meta["highest_degree"] == "PhD"
+
+
+def test_sample_resumes_metadata():
+    by_file = {
+        Path(r["path"]).name: _meta(r["content"], resume_path=r["path"])
+        for r in resume_rag.load_resumes(str(RESUMES_DIR))
+    }
+    assert len(by_file) == 12
+    for meta in by_file.values():
+        assert meta["name"] and meta["email"] and meta["skills"] and meta["education"]
+        assert meta["experience_years"] > 0
+    assert by_file["resume_priya_patel.docx"]["highest_degree"] == "PhD"
+    assert by_file["resume_liam_oconnor.docx"]["name"] == "Liam O'Connor"
+    assert by_file["resume_john_doe.pdf"]["skill_years"]["Python"] >= 5
+    assert by_file["resume_daniel_kim.txt"]["skill_years"]["Python"] < 5
+
+
+# --- LLM fallback ------------------------------------------------------------------------------
+
+
+class FakeLLM:
+    def __init__(self, content=None, error=None):
+        self.calls = []
+        self._content = content
+        self._error = error
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    def _create(self, **kwargs):
+        self.calls.append(kwargs)
+        if self._error:
+            raise self._error
+        message = SimpleNamespace(content=json.dumps(self._content))
+        return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+
+def test_llm_not_called_when_rules_find_everything():
+    llm = FakeLLM({})
+    _meta(SAMPLE, llm_client=llm)
+    assert llm.calls == []
+
+
+def test_llm_fills_only_missing_fields():
+    text = "jane@x.com\nSKILLS\nPython\nEXPERIENCE\nDev, X (2020 - 2022)"
+    llm = FakeLLM(
+        {
+            "name": "Jane Roe",
+            "education": ["MSc Physics, Oxford, 2019"],
+            "highest_degree": None,
+        }
+    )
+    meta = _meta(text, llm_client=llm, llm_model="test-model")
+
+    assert meta["name"] == "Jane Roe"
+    assert meta["education"] == ["MSc Physics, Oxford, 2019"]
+    assert meta["highest_degree"] == "Master's"  # derived when the LLM gives none
+    assert meta["experience_years"] == 2.0  # from rules, not asked
+    assert meta["llm_fields"] == ["name", "education"]
+
+    (call,) = llm.calls
+    assert call["model"] == "test-model"
+    schema = call["response_format"]["json_schema"]["schema"]
+    assert sorted(schema["properties"]) == ["education", "highest_degree", "name"]
+
+
+def test_llm_invalid_values_are_ignored():
+    llm = FakeLLM({"name": "", "experience_years": -3, "education": []})
+    meta = _meta("hello world", resume_path="cv_bob_stone.txt", llm_client=llm)
+    assert meta["llm_fields"] == []
+    assert meta["name"] == "Bob Stone"
+    assert meta["experience_years"] is None
+
+
+def test_llm_error_is_logged_not_raised(caplog):
+    error = openai.APIConnectionError(request=SimpleNamespace(method="POST", url="x"))
+    meta = _meta("hello world", resume_path="x/resume_ann_lee.pdf", llm_client=FakeLLM(error=error))
+    assert meta["name"] == "Ann Lee"
+    assert "LLM metadata fallback failed" in caplog.text
+
+
+def test_make_llm_client_without_key_returns_none(monkeypatch):
+    monkeypatch.setattr(resume_rag, "load_dotenv", lambda: None)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    assert resume_rag.make_llm_client() is None
