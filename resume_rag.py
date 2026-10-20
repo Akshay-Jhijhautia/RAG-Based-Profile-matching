@@ -47,7 +47,7 @@ DEFAULT_DB_DIR = "chroma_db"
 COLLECTION_NAME = "resumes"
 # Part of every resume's content hash: bump it when chunking or metadata
 # extraction changes so the next `index` run refreshes every resume.
-PIPELINE_VERSION = "1"
+PIPELINE_VERSION = "2"
 
 MAX_CHUNK_CHARS = 1500
 HEADER_SECTION = "Header"
@@ -503,12 +503,15 @@ def _extract_experience(
     return total, skill_years
 
 
+def degrees_mentioned(text: str) -> list[str]:
+    """Every degree named in ``text``, highest first (keys of ``DEGREE_LEVELS``)."""
+    return [degree for degree, pattern in _DEGREE_PATTERNS if pattern.search(text)]
+
+
 def degree_level(text: str) -> str | None:
     """Highest degree named in ``text``: ``"PhD"``, ``"Master's"``, ``"Bachelor's"``, ``"Associate"``."""
-    for degree, pattern in _DEGREE_PATTERNS:  # ordered highest first
-        if pattern.search(text):
-            return degree
-    return None
+    found = degrees_mentioned(text)
+    return found[0] if found else None
 
 
 def _extract_education(sections: dict[str, str]) -> tuple[list[str], str | None]:
@@ -671,11 +674,18 @@ class OpenAIEmbedder:
         return vectors
 
 
+_STOPWORDS = frozenset(
+    "a an and are as at be by for from has have in into is it of on or our over the to "
+    "using we will with you your experience years year building built strong".split()
+)
+
+
 class HashingEmbedder:
     """Offline bag-of-words embedder: hashed token counts, L2-normalized.
 
     It only captures word overlap, not meaning. It exists for tests and for
-    trying the pipeline without an API key.
+    trying the pipeline without an API key. Stopwords (and filler such as
+    "experience") are dropped so shared boilerplate does not dominate.
     """
 
     def __init__(self, dimensions: int = 512):
@@ -688,6 +698,8 @@ class HashingEmbedder:
     def _vector(self, text: str) -> list[float]:
         vector = [0.0] * self.dimensions
         for token in re.findall(r"[a-z0-9+#]+", text.lower()):
+            if token in _STOPWORDS:
+                continue
             digest = hashlib.md5(token.encode("utf-8")).digest()
             vector[int.from_bytes(digest[:4], "big") % self.dimensions] += 1.0
         norm = math.sqrt(sum(v * v for v in vector)) or 1.0

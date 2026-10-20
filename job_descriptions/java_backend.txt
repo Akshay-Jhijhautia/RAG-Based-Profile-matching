@@ -1,0 +1,11 @@
+Backend Java Engineer (Payments)
+
+Requirements:
+- 6+ years of professional software development experience
+- Strong Java and Spring Boot skills
+- Experience with Kafka event streaming and relational databases (Oracle or PostgreSQL)
+- Familiarity with Kubernetes and CI/CD
+- Bachelor's degree in Computer Science or equivalent
+
+Preferred:
+- Experience in financial services or trade settlement systems

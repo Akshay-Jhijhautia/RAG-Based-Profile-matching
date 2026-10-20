@@ -1,0 +1,17 @@
+Senior Machine Learning Engineer
+
+About the role:
+We are looking for a Senior Machine Learning Engineer to build and ship NLP and LLM-powered
+features, from model training to production serving.
+
+Requirements:
+- 5+ years of Python experience building production systems
+- Hands-on experience with PyTorch or TensorFlow and scikit-learn
+- Experience deploying models with Docker and Kubernetes on AWS
+- Strong background in NLP and machine learning
+- Bachelor's or Master's degree in Computer Science or a related field
+
+Nice to have:
+- Experience with retrieval-augmented generation and Hugging Face
+- MLflow or Kubeflow for experiment tracking
+- PhD in a quantitative field

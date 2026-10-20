@@ -1,0 +1,12 @@
+Frontend Engineer
+
+You will build accessible, fast web applications used by millions of readers.
+
+What you'll need:
+- 3+ years of experience with React and TypeScript
+- Solid CSS skills; Tailwind CSS is a plus
+- Testing with Jest or Cypress
+- A strong eye for accessibility (WCAG)
+
+Bonus points:
+- Next.js and GraphQL
