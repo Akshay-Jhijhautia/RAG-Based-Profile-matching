@@ -145,7 +145,11 @@ match_score = round(100 × (0.5 × semantic + 0.2 × keyword + 0.3 × skill_cove
 ```
 
 - **semantic**: the cosine similarity rescaled to 0..1 over the embedder's
-  typical range: OpenAI 0.20–0.60, hashing 0.0–0.50 (`SEMANTIC_RANGES`).
+  typical range: OpenAI 0.30–0.65, hashing 0.0–0.50 (`SEMANTIC_RANGES`).
+  The OpenAI range comes from the sample data, where JD/resume similarities
+  ran from 0.34 (unrelated) to 0.62 (near-perfect fit). Unrelated resumes
+  therefore score close to 0 on this signal, and strong matches don't hit the
+  top of the scale.
 - **keyword**: the BM25 score relative to the best resume, 0..1.
 - **skill_coverage**: required skills matched ÷ required skills. If the JD
   names no skills, its weight is shared between the other two.
@@ -206,5 +210,6 @@ with the hashing embedder.
   year requirements.
 - **Keyword scores** are relative to the best resume in the index, so they
   rank candidates but don't measure absolute fit on their own.
-- **The OpenAI semantic range** (0.20–0.60) is a heuristic. Adjust
-  `SEMANTIC_RANGES` if scores look compressed or inflated for your data.
+- **The OpenAI semantic range** (0.30–0.65) was tuned on 12 sample resumes
+  and 3 JDs. Run with `--details` and check `semantic_similarity` on your
+  own data. Adjust `SEMANTIC_RANGES` if scores look compressed or inflated.

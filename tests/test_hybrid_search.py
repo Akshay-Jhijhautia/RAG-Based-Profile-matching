@@ -135,8 +135,10 @@ def test_semantic_candidates_restricted_to_paths(matcher):
 
 
 def test_calibrate_semantic():
-    assert job_matcher.calibrate_semantic(0.40, "openai:text-embedding-3-small") == pytest.approx(0.5)
-    assert job_matcher.calibrate_semantic(0.10, "openai:x") == 0.0
+    assert job_matcher.calibrate_semantic(0.475, "openai:text-embedding-3-small") == pytest.approx(0.5)
+    assert job_matcher.calibrate_semantic(0.30, "openai:x") == 0.0
+    assert job_matcher.calibrate_semantic(0.20, "openai:x") == 0.0
+    assert job_matcher.calibrate_semantic(0.65, "openai:x") == pytest.approx(1.0)
     assert job_matcher.calibrate_semantic(0.90, "openai:x") == 1.0
     assert job_matcher.calibrate_semantic(0.25, "hashing:512") == pytest.approx(0.5)
     assert job_matcher.calibrate_semantic(0.3, "unknown") == pytest.approx(0.3)

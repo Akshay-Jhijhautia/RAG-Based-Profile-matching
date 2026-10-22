@@ -48,9 +48,9 @@ SKILL_WEIGHT = 0.3
 # Query repeats per skill token: required skills count double in BM25.
 REQUIRED_SKILL_BOOST = 2
 # Cosine similarity range mapped onto 0..1 before blending, per embedder kind.
-# Real embedders rarely go below ~0.2 for unrelated text or above ~0.6 for a
-# strong JD/resume match, so raw similarity would compress every score.
-SEMANTIC_RANGES = {"openai": (0.20, 0.60), "hashing": (0.0, 0.50)}
+# Raw similarity would compress every score: with text-embedding-3-small the
+# sample JD/resume pairs measured 0.34 (unrelated) to 0.62 (near-perfect fit).
+SEMANTIC_RANGES = {"openai": (0.30, 0.65), "hashing": (0.0, 0.50)}
 DEFAULT_SEMANTIC_RANGE = (0.0, 1.0)
 # Chunks retrieved per query before grouping by candidate (about 4-5 per resume).
 CHUNK_POOL = 50
